@@ -1,52 +1,100 @@
-from groq import Groq
-from dotenv import load_dotenv
 import os
 import json
+import logging
+from typing import Dict, List
+from pydantic import BaseModel, Field, ValidationError
+from groq import Groq, GroqError
+from dotenv import load_dotenv
 
-# Carrega as variáveis do arquivo .env
+# Configuração de logging profissional
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("GeradorQuiz")
+
 load_dotenv()
-API_KEY = os.getenv("GROQ_API_KEY")
 
-# Cria o client da Groq
-client = Groq(api_key=API_KEY)
+
+class ParPerguntaResposta(BaseModel):
+    pergunta: str = Field(..., description="Uma pergunta clara e desafiadora estilo prova universitária.")
+    resposta: str = Field(..., description="A resposta detalhada, didática e correta para a pergunta.")
+
+
+class QuizSchema(BaseModel):
+    """Garante que a IA retorne uma lista exata de perguntas e respostas estruturadas."""
+    questoes: List[ParPerguntaResposta] = Field(..., description="Lista contendo exatamente as questões solicitadas.")
 
 
 class Gerador:
-    def __init__(self, modelo):
-        self.model = modelo
-    
-    def gerar_perguntas(self, tema: str) -> dict:
-        prompt = {
-            "role" : f"Você é um especialista no tema: {tema}.",
-            "tone" : ["Educado", "Didático"],
-            "context" : f"Alunos da universidade precisam de ajuda para estudar o tema: {tema} através de um aplicativo de perguntas e respostas.",
-            "task" : f"Você deve gerar 10 perguntas e respostas didáticas para sobre o tema: {tema}.",
-            "constraints" : ["O output deve ser uma json string com 10 pares {pergunta : resposta}", 
-                            "Não retorne nenhum texto à mais, apenas a json string respeitando o formato explícito em output_format", 
-                            "Todas as perguntas devem se parecer com uma pergunta de prova.",
-                            "Cada chave da json string deve ser uma pergunta sobre o tema, e cada valor deve ser a resposta correspondente à pergunta",
-                            "As chaves não devem ser: Pergunta_1, Pergunta_2 etc... elas devem ser perguntas reais"],
-            "example" : "{'Ao que o tema se refere?' : 'O tema se refere à...', 'Onde aplicamos o conceito...? : 'O conceito é aplicado quando...' }",
-            "output_format": """{"pergunta_1": "resposta_1", "pergunta_2":"resposta_2"}""",
-        }
-    
-        try:
-            resposta = client.chat.completions.create(
-                model=self.model,
-                messages=[{
-                    "role" : "user",
-                    "content" : json.dumps(prompt)
-                }]
-            )
-            return json.loads(resposta.choices[0].message.content)
+    """Gerador de quiz inteligente utilizando Groq e validação estricta com Pydantic."""
+
+    def __init__(self, modelo: str = "llama-3.3-70b-versatile") -> None:
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            raise ValueError("A chave GROQ_API_KEY não foi encontrada nas variáveis de ambiente.")
         
+        self.client = Groq(api_key=api_key)
+        self.model = modelo
+
+    def _construir_prompt(self, tema: str, quantidade: int) -> str:
+        return f"""
+        Você é um professor universitário sênior e especialista no tema: {tema}.
+        Seu objetivo é criar material de estudo de alta qualidade para estudantes universitários.
+
+        Gere exatamente {quantidade} perguntas e respostas didáticas sobre o tema: {tema}.
+        As perguntas devem exigir raciocínio crítico, parecendo questões de provas acadêmicas reais.
+
+        FORMATO DE SAÍDA OBRIGATÓRIO (JSON):
+        O JSON deve seguir estritamente este formato de lista de objetos:
+        {{
+          "questoes": [
+            {{
+              "pergunta": "Texto da pergunta aqui?",
+              "resposta": "Explicação detalhada da resposta aqui."
+            }}
+          ]
+        }}
+        """
+
+    def gerar_perguntas(self, tema: str, quantidade: int = 10, tentativas_maximas: int = 3) -> Dict[str, str]:
+        """Gera e valida as perguntas, retornando um dicionário limpo no formato {pergunta: resposta}."""
+        prompt = self._construir_prompt(tema, quantidade)
+
+        for tentativa in range(1, tentativas_maximas + 1):
+            try:
+                logger.info(f"Tentativa {tentativa}/{tentativas_maximas} gerando quiz para o tema: '{tema}'...")
+
+                resposta = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": prompt}],
+                    response_format={"type": "json_object"}
+                )
+
+                conteudo_bruto = resposta.choices[0].message.content
+                dados_json = json.loads(conteudo_bruto)
+
+                # Valida o formato usando Pydantic
+                quiz_validado = QuizSchema(**dados_json)
+
+                # Transforma a lista validada no dicionário clássico {pergunta: resposta}
+                quiz_dict = {q.pergunta: q.resposta for q in quiz_validado.questoes}
+
+                logger.info("Quiz gerado e validado com sucesso!")
+                return quiz_dict
+
+            except (GroqError, json.JSONDecodeError, ValidationError) as e:
+                logger.warning(f"Falha na tentativa {tentativa}: {e}. Tentando novamente...")
+        
+        logger.error("Todas as tentativas de geração falharam.")
+        return {}
+
+    @staticmethod
+    def salvar_json(dados: Dict[str, str], caminho: str = "quiz_estudo.json") -> None:
+        """Salva o dicionário final formatado em um arquivo JSON."""
+        try:
+            with open(caminho, "w", encoding="utf-8") as f:
+                json.dump(dados, f, indent=4, ensure_ascii=False)
+            logger.info(f"Arquivo salvo com sucesso em: {caminho}")
         except Exception as e:
-            print(f'Erro: {e}')
-            return e
-
-
-if '__main__' == __name__:
-    g = Gerador("openai/gpt-oss-120b")
-
-    dados = g.gerar_perguntas('Python Básico')
-    print(dados)
+            logger.error(f"Erro ao salvar arquivo: {e}")
